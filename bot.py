@@ -1,21 +1,123 @@
 import os
 import time
 import threading
+import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from smsbower import SMSBowerAPI
 
-# 🔐 Environment Variable থেকে API Key নেওয়া (Railway-এর জন্য নিরাপদ)
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-SMS_API_KEY = os.environ.get("SMS_API_KEY")
+# =====================================================================
+# ⚙️ কনফিগারেশন ও সিকিউরিটি সেটআপ
+# =====================================================================
+# Railway Variables থেকে টোকেন নেবে, না পেলে নিচের ডিফল্ট ভ্যালু ব্যবহার করবে
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+SMS_API_KEY = os.getenv("SMS_API_KEY", "YOUR_SMSBOWER_API_KEY")
 
-if not BOT_TOKEN or not SMS_API_KEY:
-    raise ValueError("⚠️ BOT_TOKEN or SMS_API_KEY environment variable is missing!")
+SERVICE = "cdy"          # Caddy সার্ভিস কোড
+TIMEOUT_SECONDS = 130    # ১৩০ সেকেন্ড (২ মিনিট ১০ সেকেন্ড)
+BASE_URL = "https://smsbower.page/stubs/handler_api.php"
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+# =====================================================================
+# 🛠️ SMSBower API হেলপার ক্লাস
+# =====================================================================
+class SMSBowerAPI:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+
+    def get_balance(self) -> float:
+        """অ্যাকাউন্ট ব্যালেন্স ফ্রেচ করে (ACCESS_BALANCE:15.50 ফরম্যাট ফিক্স করা)"""
+        params = {"api_key": self.api_key, "action": "getBalance"}
+        try:
+            res = requests.get(BASE_URL, params=params).text.strip()
+            if "ACCESS_BALANCE:" in res:
+                return float(res.split("ACCESS_BALANCE:")[1].strip())
+            elif res == "BAD_KEY":
+                print("❌ Error: Invalid API Key")
+        except Exception as e:
+            print(f"Balance Fetch Error: {e}")
+        return 0.0
+
+    def get_country_names(self) -> dict:
+        """সব দেশের নাম ও আইডি নিয়ে আসে"""
+        params = {"api_key": self.api_key, "action": "getCountries"}
+        try:
+            res = requests.get(BASE_URL, params=params).json()
+            country_dict = {}
+            if isinstance(res, list):
+                for c in res:
+                    country_dict[str(c.get("id"))] = c.get("eng", f"Country {c.get('id')}")
+            elif isinstance(res, dict):
+                for cid, c in res.items():
+                    if isinstance(c, dict):
+                        country_dict[str(cid)] = c.get("eng", f"Country {cid}")
+            return country_dict
+        except Exception as e:
+            print(f"Country Fetch Error: {e}")
+            return {}
+
+    def get_available_countries(self) -> list:
+        """Caddy স্টকে থাকা দেশ ও প্রাইস লিস্ট আনে"""
+        country_names = self.get_country_names()
+        params = {"api_key": self.api_key, "action": "getPrices", "service": SERVICE}
+        try:
+            prices_data = requests.get(BASE_URL, params=params).json()
+        except Exception as e:
+            print(f"Prices Fetch Error: {e}")
+            return []
+
+        available_list = []
+        for c_id, services in prices_data.items():
+            if SERVICE in services:
+                cost = services[SERVICE].get("cost", 0)
+                count = services[SERVICE].get("count", 0)
+                if count > 0:
+                    c_name = country_names.get(str(c_id), f"Country {c_id}")
+                    available_list.append({
+                        "id": str(c_id),
+                        "name": c_name,
+                        "cost": cost,
+                        "count": count
+                    })
+        # দাম অনুযায়ী সর্টিং
+        available_list.sort(key=lambda x: x["cost"])
+        return available_list
+
+    def get_number(self, country_id: str):
+        """নাম্বার কেনা"""
+        params = {
+            "api_key": self.api_key,
+            "action": "getNumber",
+            "service": SERVICE,
+            "country": country_id
+        }
+        res = requests.get(BASE_URL, params=params).text.strip()
+        if res.startswith("ACCESS_NUMBER:"):
+            _, act_id, phone = res.split(":", 2)
+            return act_id, phone
+        return None, None
+
+    def set_status(self, act_id: str, status: int) -> str:
+        """স্ট্যাটাস পরিবর্তন (6 = Complete, 8 = Cancel)"""
+        params = {
+            "api_key": self.api_key,
+            "action": "setStatus",
+            "id": act_id,
+            "status": status
+        }
+        return requests.get(BASE_URL, params=params).text.strip()
+
+    def check_status(self, act_id: str) -> str:
+        """OTP স্টেটাস চেক"""
+        params = {"api_key": self.api_key, "action": "getStatus", "id": act_id}
+        return requests.get(BASE_URL, params=params).text.strip()
+
+# API ক্লাসের অবজেক্ট তৈরি
 sms_api = SMSBowerAPI(SMS_API_KEY)
 
-TIMEOUT_SECONDS = 130
+# =====================================================================
+# 🤖 টেলিগ্রাম বোট হ্যান্ডলার
+# =====================================================================
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
@@ -37,10 +139,12 @@ def send_welcome(message):
 def callback_listener(call):
     chat_id = call.message.chat.id
     
+    # ১. ব্যালেন্স বাটন
     if call.data == "check_balance":
         balance = sms_api.get_balance()
         bot.answer_callback_query(call.id, f"আপনার বর্তমান ব্যালেন্স: ${balance:.4f}", show_alert=True)
 
+    # ২. Caddy নাম্বার কেনা
     elif call.data == "buy_caddy":
         bot.edit_message_text("🔍 স্টকে থাকা দেশ ও প্রাইস লিস্ট লোড হচ্ছে...", chat_id, call.message.message_id)
         countries = sms_api.get_available_countries()
@@ -59,6 +163,7 @@ def callback_listener(call):
         markup.add(InlineKeyboardButton("🔙 প্রধান মেনু", callback_data="main_menu"))
         bot.send_message(chat_id, "🌎 **কোন দেশের নাম্বার নিতে চান বেছে নিন:**", parse_mode="Markdown", reply_markup=markup)
 
+    # ৩. নির্দিষ্ট দেশ সিলেক্ট করা
     elif call.data.startswith("getnum_"):
         country_id = call.data.split("_")[1]
         bot.answer_callback_query(call.id, "নাম্বার রিকোয়েস্ট করা হচ্ছে...")
@@ -84,8 +189,11 @@ def callback_listener(call):
             f"⏳ *বোট ব্যাকগ্রাউন্ডে ২ মিনিট ১০ সেকেন্ড OTP এর জন্য অপেক্ষা করছে...*"
         )
         msg = bot.send_message(chat_id, msg_text, parse_mode="Markdown", reply_markup=markup)
+        
+        # থ্রেড দিয়ে ব্যাকগ্রাউন্ডে OTP পাওয়ার জন্য ওয়েট করা
         threading.Thread(target=auto_otp_worker, args=(chat_id, msg.message_id, act_id)).start()
 
+    # ৪. ম্যানুয়াল OTP চেক
     elif call.data.startswith("checkotp_"):
         act_id = call.data.split("_")[1]
         status = sms_api.check_status(act_id)
@@ -97,6 +205,7 @@ def callback_listener(call):
         else:
             bot.answer_callback_query(call.id, "এখনো OTP আসেনি! অপেক্ষা করুন...", show_alert=True)
 
+    # ৫. ম্যানুয়াল ক্যানসেল
     elif call.data.startswith("cancel_"):
         act_id = call.data.split("_")[1]
         res = sms_api.set_status(act_id, 8)
@@ -106,9 +215,13 @@ def callback_listener(call):
         elif res == "EARLY_CANCEL_DENIED":
             bot.answer_callback_query(call.id, "⚠️ নাম্বার নেওয়ার ২ মিনিটের মধ্যে ক্যানসেল করা যায় না!", show_alert=True)
 
+    # ৬. প্রধান মেনু
     elif call.data == "main_menu":
         send_welcome(call.message)
 
+# =====================================================================
+# 🔄 ব্যাকগ্রাউন্ড অটো থ্রেড (OTP Polling)
+# =====================================================================
 def auto_otp_worker(chat_id, message_id, act_id):
     start_time = time.time()
     while time.time() - start_time < TIMEOUT_SECONDS:
@@ -126,6 +239,7 @@ def auto_otp_worker(chat_id, message_id, act_id):
             return
         time.sleep(5)
 
+    # সময় শেষ হলে ক্যানসেল করা
     cancel_res = sms_api.set_status(act_id, 8)
     balance = sms_api.get_balance()
     if cancel_res == "ACCESS_CANCEL":
@@ -134,6 +248,9 @@ def auto_otp_worker(chat_id, message_id, act_id):
             chat_id, message_id, parse_mode="Markdown"
         )
 
+# =====================================================================
+# 🚀 বোট স্টার্ট
+# =====================================================================
 if __name__ == "__main__":
     print("🤖 Telegram Bot is running...")
     bot.infinity_polling()
