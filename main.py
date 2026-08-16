@@ -3,23 +3,44 @@ import time
 import threading
 import requests
 import telebot
+import json
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # =====================================================================
-# ⚙️ কনফিগারেশন ও সিকিউরিটি সেটআপ (Env Variables)
+# ⚙️ কনফিগারেশন
 # =====================================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-SMS_API_KEY = os.getenv("SMS_API_KEY", "").strip()
+# SMS_API_KEY এখন আর গ্লোবাল নয়, ইউজারদের থেকে ইনপুট নেওয়া হবে।
 
-SERVICE = "cdy"          # Caddy সার্ভিস কোড
-TIMEOUT_SECONDS = 130    # ১৩০ সেকেন্ড (২ মিনিট ১০ সেকেন্ড)
+SERVICE = "cdy"
+TIMEOUT_SECONDS = 130
 BASE_URL = "https://smsbower.page/stubs/handler_api.php"
-ITEMS_PER_PAGE = 10      # প্রতি পেজে দেশের সংখ্যা
+ITEMS_PER_PAGE = 10
+DB_FILE = "users.json"
 
-if not BOT_TOKEN or not SMS_API_KEY:
-    print("⚠️ WARNING: BOT_TOKEN or SMS_API_KEY is not set properly in Environment Variables!")
+if not BOT_TOKEN:
+    print("⚠️ WARNING: BOT_TOKEN is not set in Environment Variables!")
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+# =====================================================================
+# 💾 ডেটাবেস সিস্টেম (JSON ভিত্তিক)
+# =====================================================================
+def load_users():
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_users(data):
+    with open(DB_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+# মেমোরিতে ইউজারদের ডাটা লোড করা হলো
+users_db = load_users()
 
 # =====================================================================
 # 🛠️ SMSBower API হেলপার ক্লাস
@@ -37,7 +58,7 @@ class SMSBowerAPI:
                 return float(res.split("ACCESS_BALANCE:")[1].strip())
         except Exception as e:
             print(f"Balance Fetch Error: {e}")
-        return 0.0
+        return -1.0  # -1.0 মানে এন্ট্রি/কি ভুল
 
     def get_country_names(self) -> dict:
         params = {"api_key": self.api_key, "action": "getCountries"}
@@ -52,8 +73,7 @@ class SMSBowerAPI:
                     if isinstance(c, dict):
                         country_dict[str(cid)] = c.get("eng", f"Country {cid}")
             return country_dict
-        except Exception as e:
-            print(f"Country Fetch Error: {e}")
+        except:
             return {}
 
     def get_available_countries(self) -> list:
@@ -61,8 +81,7 @@ class SMSBowerAPI:
         params = {"api_key": self.api_key, "action": "getPrices", "service": SERVICE}
         try:
             prices_data = self.session.get(BASE_URL, params=params, timeout=10).json()
-        except Exception as e:
-            print(f"Prices Fetch Error: {e}")
+        except:
             return []
 
         available_list = []
@@ -88,32 +107,29 @@ class SMSBowerAPI:
             if res.startswith("ACCESS_NUMBER:"):
                 _, act_id, phone = res.split(":", 2)
                 return act_id, phone
-        except Exception as e:
-            print(f"Get Number Error: {e}")
+        except:
+            pass
         return None, None
 
     def set_status(self, act_id: str, status: int) -> str:
         params = {"api_key": self.api_key, "action": "setStatus", "id": act_id, "status": status}
         try:
             return self.session.get(BASE_URL, params=params, timeout=10).text.strip()
-        except Exception as e:
+        except:
             return ""
 
     def check_status(self, act_id: str) -> str:
         params = {"api_key": self.api_key, "action": "getStatus", "id": act_id}
         try:
             return self.session.get(BASE_URL, params=params, timeout=10).text.strip()
-        except Exception as e:
+        except:
             return ""
-
-sms_api = SMSBowerAPI(SMS_API_KEY)
 
 # =====================================================================
 # 🤖 টেলিগ্রাম বোট হ্যান্ডলার
 # =====================================================================
 
 def get_after_action_markup():
-    """কাজ শেষ হওয়ার পর আবার মেনু দেখানোর বাটন"""
     markup = InlineKeyboardMarkup()
     markup.add(
         InlineKeyboardButton("📱 আবার নাম্বার নিন", callback_data="caddypage_0"),
@@ -121,22 +137,66 @@ def get_after_action_markup():
     )
     return markup
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
+def show_main_menu(chat_id, user_api_key, message_id=None):
+    sms_api = SMSBowerAPI(user_api_key)
     balance = sms_api.get_balance()
+    
+    if balance == -1.0:
+        bot.send_message(chat_id, "❌ আপনার API Key টি সঠিক নয় বা কাজ করছে না। দয়া করে নতুন API Key দিন।")
+        request_api_key(chat_id)
+        return
+
     markup = InlineKeyboardMarkup()
     markup.add(
         InlineKeyboardButton("💰 চেক ব্যালেন্স", callback_data="check_balance"),
         InlineKeyboardButton("📱 Caddy নাম্বার নিন", callback_data="caddypage_0")
     )
-    welcome_text = (
+    markup.add(InlineKeyboardButton("🔑 API Key পরিবর্তন করুন", callback_data="change_api"))
+    
+    text = (
         f"👋 **স্বাগতম! Caddy OTP বোট-এ।**\n\n"
         f"💳 **আপনার বর্তমান ব্যালেন্স:** `${balance:.4f}`\n\n"
         f"নিচের বাটন চেপে কাজ শুরু করুন:"
     )
-    bot.send_message(message.chat.id, welcome_text, parse_mode="Markdown", reply_markup=markup)
+    
+    if message_id:
+        bot.edit_message_text(text, chat_id, message_id, parse_mode="Markdown", reply_markup=markup)
+    else:
+        bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
 
-def show_country_page(chat_id, message_id, page: int):
+def request_api_key(chat_id):
+    msg = bot.send_message(
+        chat_id, 
+        "🔑 **অনুগ্রহ করে আপনার SMSBower API Key টি দিন:**\n*(এটি আপনার ব্যক্তিগত ব্যালেন্স থেকে কাটবে)*",
+        parse_mode="Markdown"
+    )
+    bot.register_next_step_handler(msg, save_api_key_step)
+
+def save_api_key_step(message):
+    chat_id = str(message.chat.id)
+    api_key = message.text.strip()
+    
+    # ব্যালেন্স চেক করে দেখি Key ভ্যালিড কি না
+    sms_api = SMSBowerAPI(api_key)
+    if sms_api.get_balance() != -1.0:
+        users_db[chat_id] = api_key
+        save_users(users_db)
+        bot.send_message(chat_id, "✅ আপনার API Key সফলভাবে সেভ হয়েছে!")
+        show_main_menu(chat_id, api_key)
+    else:
+        bot.send_message(chat_id, "❌ ভুল API Key! দয়া করে সঠিক Key দিন।")
+        request_api_key(chat_id)
+
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    chat_id = str(message.chat.id)
+    if chat_id in users_db:
+        show_main_menu(chat_id, users_db[chat_id])
+    else:
+        request_api_key(chat_id)
+
+def show_country_page(chat_id, message_id, page: int, user_api_key: str):
+    sms_api = SMSBowerAPI(user_api_key)
     bot.edit_message_text("🔍 স্টকে থাকা দেশ ও প্রাইস লিস্ট লোড হচ্ছে...", chat_id, message_id)
     countries = sms_api.get_available_countries()
     
@@ -169,14 +229,27 @@ def show_country_page(chat_id, message_id, page: int):
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback_listener(call):
-    chat_id = call.message.chat.id
+    chat_id = str(call.message.chat.id)
     message_id = call.message.message_id
     
+    if chat_id not in users_db:
+        bot.answer_callback_query(call.id, "আপনার API Key সেট করা নেই!", show_alert=True)
+        bot.delete_message(chat_id, message_id)
+        request_api_key(chat_id)
+        return
+
+    user_api_key = users_db[chat_id]
+    sms_api = SMSBowerAPI(user_api_key)
+
     if call.data == "check_balance":
         bot.answer_callback_query(call.id, f"আপনার বর্তমান ব্যালেন্স: ${sms_api.get_balance():.4f}", show_alert=True)
 
+    elif call.data == "change_api":
+        bot.delete_message(chat_id, message_id)
+        request_api_key(chat_id)
+
     elif call.data.startswith("caddypage_"):
-        show_country_page(chat_id, message_id, int(call.data.split("_")[1]))
+        show_country_page(chat_id, message_id, int(call.data.split("_")[1]), user_api_key)
 
     elif call.data.startswith("getnum_"):
         country_id = call.data.split("_")[1]
@@ -198,13 +271,13 @@ def callback_listener(call):
             f"📱 **নম্বর:** `+{phone}`\n"
             f"🆔 **ID:** `{act_id}`\n"
             f"💰 **অবশিষ্ট ব্যালেন্স:** `${sms_api.get_balance():.4f}`\n\n"
-            f"⏳ *বোট ব্যাকগ্রাউন্ডে অটোমেটিক OTP খুঁজছে... (সর্বোচ্চ ২ মিনিট)*"
+            f"⏳ *বোট ব্যাকগ্রাউন্ডে অটোমেটিক OTP খুঁজছে...*"
         )
         bot.delete_message(chat_id, message_id)
         msg = bot.send_message(chat_id, msg_text, parse_mode="Markdown", reply_markup=markup)
         
-        # অটোমেটিক OTP চেকার শুরু
-        threading.Thread(target=auto_otp_worker, args=(chat_id, msg.message_id, act_id), daemon=True).start()
+        # থ্রেডে API KEY পাস করা হলো
+        threading.Thread(target=auto_otp_worker, args=(chat_id, msg.message_id, act_id, user_api_key), daemon=True).start()
 
     elif call.data.startswith("checkotp_"):
         act_id = call.data.split("_")[1]
@@ -224,13 +297,13 @@ def callback_listener(call):
             bot.answer_callback_query(call.id, "⚠️ নাম্বার নেওয়ার ২ মিনিটের মধ্যে ক্যানসেল করা যায় না!", show_alert=True)
 
     elif call.data == "main_menu":
-        bot.delete_message(chat_id, message_id)
-        send_welcome(call.message)
+        show_main_menu(chat_id, user_api_key, message_id)
 
 # =====================================================================
 # 🔄 ব্যাকগ্রাউন্ড অটো থ্রেড (OTP Polling)
 # =====================================================================
-def auto_otp_worker(chat_id, message_id, act_id):
+def auto_otp_worker(chat_id, message_id, act_id, api_key):
+    sms_api = SMSBowerAPI(api_key)
     try:
         start_time = time.time()
         while time.time() - start_time < TIMEOUT_SECONDS:
@@ -238,11 +311,8 @@ def auto_otp_worker(chat_id, message_id, act_id):
             if status.startswith("STATUS_OK:"):
                 otp = status.split(":", 1)[1]
                 sms_api.set_status(act_id, 6)
-                balance = sms_api.get_balance()
-                
-                # OTP আসার পর আবার বাটন দেওয়া হচ্ছে
                 bot.edit_message_text(
-                    f"🎉 **OTP রিসিভ হয়েছে!**\n\n🔑 **OTP:** `{otp}`\n💰 **বর্তমান ব্যালেন্স:** `${balance:.4f}`",
+                    f"🎉 **OTP রিসিভ হয়েছে!**\n\n🔑 **OTP:** `{otp}`\n💰 **বর্তমান ব্যালেন্স:** `${sms_api.get_balance():.4f}`",
                     chat_id, message_id, parse_mode="Markdown", reply_markup=get_after_action_markup()
                 )
                 return
@@ -250,7 +320,6 @@ def auto_otp_worker(chat_id, message_id, act_id):
                 return
             time.sleep(5)
 
-        # সময় শেষ হলে ক্যানসেল করা এবং বাটন দেওয়া
         cancel_res = sms_api.set_status(act_id, 8)
         if cancel_res == "ACCESS_CANCEL":
             bot.edit_message_text(
@@ -264,5 +333,5 @@ def auto_otp_worker(chat_id, message_id, act_id):
 # 🚀 বোট স্টার্ট
 # =====================================================================
 if __name__ == "__main__":
-    print("🤖 Telegram Bot is starting...")
+    print("🤖 Multi-User Telegram Bot is starting...")
     bot.infinity_polling(timeout=20, long_polling_timeout=10)
